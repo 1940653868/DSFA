@@ -1,8 +1,7 @@
 import os
 import argparse
 import pickle
-import os
-import warnings
+
 import torch
 from tqdm import tqdm
 import numpy as np
@@ -31,7 +30,7 @@ from utils import TUEVLoader, HARLoader, sharpen_prob
 
     
 class LitModel_finetune(pl.LightningModule):
-    def __init__(self, args, model, save_path ='.log-multi-super/'):
+    def __init__(self, args, model, save_path ='.log-multi-super/', test_loader=None):
         super().__init__()
         self.args = args
         self.model = model
@@ -41,6 +40,7 @@ class LitModel_finetune(pl.LightningModule):
         self.save_path = save_path
         self.lmda_consistency = args.lmda_consistency
         self.tau_consistency = args.tau_consistency
+        self.test_data = test_loader
         
     def training_step(self, batch, batch_idx):
         if self.global_step % 2000 == 0:
@@ -54,7 +54,9 @@ class LitModel_finetune(pl.LightningModule):
         loss_consistency = self.lmda_consistency * F.kl_div(F.log_softmax(output_tr_mean, dim=1),
                                                     sharpen_prob(F.softmax(output, dim=1),
                                                                     temperature=self.tau_consistency), reduce='batchmean')
+        
         loss = loss_ce + loss_consistency
+        
         self.log("train_loss", loss)
         self.log("train_lossce", loss_ce)
         self.log("train_loss_consistency", loss_consistency)
@@ -70,8 +72,8 @@ class LitModel_finetune(pl.LightningModule):
             convScore = output
             step_result = convScore.cpu().numpy()
             step_gt = y.cpu().numpy()
-
         self.validation_step_outputs.append([step_result, step_gt])
+
         return step_result, step_gt
 
     def on_validation_epoch_end(self):
@@ -134,13 +136,13 @@ class LitModel_finetune(pl.LightningModule):
             lr=self.args.lr,
             weight_decay=self.args.weight_decay,
         )
-        # self.clip_gradients(optimizer, gradient_clip_val=1.0,  gradient_clip_algorithm="norm")  # 设置最大梯度范数为1.0
-        scheduler = StepLR(optimizer, step_size=5, gamma=0.5) #0.75 最优 
-        return [optimizer], [scheduler]  # 返回优化器和调度器列表
-        # return [optimizer]  # , [scheduler]
-    def on_train_epoch_end(self):
-        # self.print(f'in train epoch end on GPU {self.trainer.local_rank}')
-        pass
+        scheduler = StepLR(optimizer, step_size=2, gamma=0.5) 
+        return [optimizer], [scheduler]  
+
+
+        
+ 
+        
 def prepare_TUEV_dataloader(args):
     # set random seed
     seed = 4523
@@ -148,7 +150,7 @@ def prepare_TUEV_dataloader(args):
     torch.cuda.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     np.random.seed(seed)
-
+    
     root = "/srv/local/data/TUH/tuh_eeg_events/v2.0.0/edf"
     root = "/home/yubin.he/work_dir/datasets/TUEV/v2.0.1/edf"
     root = "/data/dataset/EEG_Fundamental_Model/TUEV/v2.0.1/edf"
@@ -170,7 +172,7 @@ def prepare_TUEV_dataloader(args):
     train_loader = torch.utils.data.DataLoader(
         TUEVLoader(
             os.path.join(
-                root, "processed_train"), train_files, args.sampling_rate, enabale_transform, encdata_mode =  args.encdata_mode
+                root, "processed_train"), train_files, args.sampling_rate, enabale_transform, encdata_mode =  args.encdata_mode, args =  args
         ),
         batch_size=args.batch_size,
         shuffle=True,
@@ -181,7 +183,7 @@ def prepare_TUEV_dataloader(args):
     test_loader = torch.utils.data.DataLoader(
         TUEVLoader(
             os.path.join(
-                root, "processed_eval"), test_files, args.sampling_rate, enabale_transform, encdata_mode =  args.encdata_mode
+                root, "processed_eval"), test_files, args.sampling_rate, enabale_transform, encdata_mode =  args.encdata_mode, args =  args
         ),
         batch_size=args.batch_size,
         shuffle=False,
@@ -191,7 +193,7 @@ def prepare_TUEV_dataloader(args):
     val_loader = torch.utils.data.DataLoader(
         TUEVLoader(
             os.path.join(
-                root, "processed_train"), val_files, args.sampling_rate, enabale_transform, encdata_mode =  args.encdata_mode
+                root, "processed_train"), val_files, args.sampling_rate, enabale_transform, encdata_mode =  args.encdata_mode, args =  args
         ),
         batch_size=args.batch_size,
         shuffle=False,
@@ -251,7 +253,8 @@ def supervised(args):
     torch.set_float32_matmul_precision('medium')
     # get data loaders
     from pytorch_lightning import seed_everything
-    seed_everything(12345, workers=True)
+    number= 12345 + args.runs_id
+    seed_everything(number, workers=True)
     # torch.backends.cudnn.deterministic = True
     # torch.backends.cudnn.benchmark = False
 
@@ -341,7 +344,6 @@ def supervised(args):
         if args.pretrain_model_path and (args.sampling_rate == 200):
             # model.biot.load_state_dict(torch.load(args.pretrain_model_path))
             from collections import OrderedDict
-
             checkpoint = torch.load(args.pretrain_model_path)
             state_dict = checkpoint['state_dict']
             new_state_dict = OrderedDict()
@@ -358,6 +360,7 @@ def supervised(args):
 
     # logger and callbacks
     version = f"{args.dataset}-{args.model}-{args.lr}-{args.batch_size}-{args.sampling_rate}-{args.token_size}-{args.hop_length}"
+
     project = "finetune_style_TUEV"
     save_path = os.path.join("log-pretrain", project)
     N_version = (
@@ -378,16 +381,20 @@ def supervised(args):
     
     save_path = os.path.join("log-pretrain", project, str(N_version))
     os.makedirs(save_path, exist_ok=True)
+
     lightning_model = LitModel_finetune(args, model, save_path=save_path)
-    
-    # if use pretrian model 
+
+
     if args.pretrain_model_path:
         min_epochs = 5
         min_epochs = 35
         devices = [int(it) for it in args.devices]
     else:
-        min_epochs = 35
-        devices = [4]
+        min_epochs = 5
+        if args.devices:
+            devices = [int(it) for it in args.devices]
+        else:
+            devices = [6]
         
     trainer = pl.Trainer(
         devices=devices,
@@ -403,24 +410,26 @@ def supervised(args):
         min_epochs = min_epochs,    
         gradient_clip_val=0.5,      
         # deterministic=True # for reproducibility
-        # limit_train_batches=0.85,
-        # fast_dev_run=45
+        # limit_train_batches=0.15,
+        # fast_dev_run=2
     )
 
     # train the model
     trainer.fit(
         lightning_model, train_dataloaders=train_loader, val_dataloaders=val_loader
     )
-    
+
     # test the model
     pretrain_result = trainer.test(
         model=lightning_model, ckpt_path="best", dataloaders=test_loader
     )[0]
     print(pretrain_result)
+    return pretrain_result
 
 
 if __name__ == "__main__":
-
+    import os
+    import warnings
     warnings.filterwarnings("ignore", category=UserWarning) 
 
     parser = argparse.ArgumentParser()
@@ -428,7 +437,7 @@ if __name__ == "__main__":
                         help="number of epochs")
     parser.add_argument("--lr", type=float, default=1e-3, help="learning rate")
     parser.add_argument("--weight_decay", type=float,
-                        default=1e-5, help="weight decay")#1e-3 ???
+                        default=1e-5, help="weight decay")
     parser.add_argument("--batch_size", type=int,
                         default=256, help="batch size")
     parser.add_argument("--num_workers", type=int,
@@ -463,26 +472,29 @@ if __name__ == "__main__":
     parser.add_argument("--lmda_consistency", type=float, default=0.5) 
     parser.add_argument("--tau_consistency", type=float, default=0.5) 
     parser.add_argument("--scaling_factor", type=float, default=15) 
-    parser.add_argument('--devices', nargs='+', default=[6],help='Pass in a list of values')
+    # parser.add_argument("--sche_gama", type=float, default=0.1) 
+    parser.add_argument('--devices', nargs='+', default=[4],help='Pass in a list of values')
+    parser.add_argument("--runs", type=int, default=5) 
     parser.add_argument("--dwt_level", type=int, default=1) 
     parser.add_argument("--style_dwtlevel", type=int, default=1) 
+    parser.add_argument("--get_five_run", type=int, default=0) 
+    parser.add_argument("--runs_id", type=int, default=0)  
     args = parser.parse_args()
     print(args)
     if args.encdata_mode =='cwt' or args.encdata_mode =='dwt':
         args.enabale_transform = True
-    supervised(args)
-    
-    # train from scracth
-    
-    # supervise pretrain
-    # python run_multiclass_stylize_supervised.py --pretrain_model_path pretrain_model/style_IIIC.ckpt  --encdata_mode dwt --devices 0
-    # python run_multiclass_stylize_supervised.py --pretrain_model_path pretrain_model/style_CHB-MIT.ckpt --devices 2
-    # python run_multiclass_stylize_supervised.py --pretrain_model_path pretrain_model/style_TUAB.ckpt --devices 1
+    result = supervised(args)
 
-    # weight_decay 5e-5
+    # train from scratch
+    # best --lmda_consistency 0.5
+    # python run_multiclass_stylize_supervised.py --runs 1 --lmda_consistency 50  --encdata_mode dwt --devices 4 
+
     
-    # best performance
-    # python run_multiclass_stylize_supervised.py --pretrain_model_path pretrain_model/style_IIIC2.ckpt  --encdata_mode dwt
-        #Loaded model weights from the checkpoint at ./log-pretrain/finetune_style_TUEV/5/checkpoints/epoch=34-step=5005.ckpt
-        # Testing DataLoader 0: 100%|█████████████████████████████████████████████████████████████████████████████████████████| 58/58 [00:08<00:00,  6.63it/s]in pred all class is: {0, 1, 2, 3, 4, 5}
-        # in test data : {'accuracy': 0.7210835797559566, 'cohen_kappa': 0.5144165905388018, 'f1_weighted': 0.746418012001614, 'balanced_accuracy': 0.5179113127150283}
+    # 考虑跑一组带均值方差的TUEV，style，无预训练
+    # python run_multiclass_stylize_supervised.py --runs 3 --lmda_consistency 50  --encdata_mode dwt --devices 4 --get_five_run 1 
+    
+    # 
+    # python run_multiclass_stylize_supervised.py --runs 3 --lmda_consistency 50  --encdata_mode dwt --devices 4 --epochs 1
+
+  
+
